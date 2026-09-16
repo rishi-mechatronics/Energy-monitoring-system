@@ -1,0 +1,192 @@
+/*
+  =====================================================================
+  Baseline logic:
+    Daily baseline = 8-15 kWh/day (IEA global average threshold).
+    Hourly usage is compared against the hourly share of that baseline:
+      < 75%        -> "Efficient Power"
+      75% - 100%   -> "Warning: Near Limit"
+      > 100%       -> "Limit Exceeded"
+  =====================================================================
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------------------------------------------------------------
+// LCD SETUP  (adress 0x27)
+// ---------------------------------------------------------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ---------------------------------------------------------------
+// PIN DEFINITIONS
+// ---------------------------------------------------------------
+const int CURRENT_SENSOR_PIN = A0;
+const int VOLTAGE_SENSOR_PIN = A1;
+const int LED_PIN            = 8;
+
+// ---------------------------------------------------------------
+// SENSOR CALIBRATION CONSTANTS
+// ---------------------------------------------------------------
+// ACS712 sensitivity: 185 mV/A (5A model), 100 mV/A (20A model), 66 mV/A (30A model)
+const float ACS_SENSITIVITY   = 0.185;
+const float ARDUINO_VREF      = 5.0;
+const int   ADC_RESOLUTION    = 1024;
+const float ACS_ZERO_VOLTAGE  = 2.5;
+
+// Voltage sensor module divider ratio
+const float VOLTAGE_DIVIDER_RATIO = 5.0;
+
+// ---------------------------------------------------------------
+// ENERGY / BASELINE SETTINGS
+// ---------------------------------------------------------------
+const float DAILY_BASELINE_KWH = 15.0;// IEA-informed upper daily baseline
+const float HOURLY_BASELINE_WH = (DAILY_BASELINE_KWH * 1000.0) / 24.0; // Wh allowed per hour
+
+// ---------------------------------------------------------------
+// RUNNING STATE
+// ---------------------------------------------------------------
+float cumulativeEnergyWh = 0.0;// Energy used since last hourly reset
+float totalEnergyWh      = 0.0;// All-time energy used (for reference/logging)
+unsigned long lastSampleTime = 0;
+unsigned long hourStartTime  = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1000;
+const unsigned long HOUR_MS = 3600000UL;
+const unsigned long DISPLAY_SWITCH_MS = 3000;
+
+unsigned long lastDisplaySwitch = 0;
+bool showEnergyScreen = true;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Energy Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  delay(2000);
+  lcd.clear();
+
+  lastSampleTime   = millis();
+  hourStartTime    = millis();
+  lastDisplaySwitch = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    float elapsedHours = (now - lastSampleTime) / 3600000.0;
+    lastSampleTime = now;
+
+    digitalWrite(LED_PIN, HIGH); // LED on while actively sampling
+
+    float current = readCurrent();
+    float voltage = readVoltage();
+    float power   = current * voltage;      // P = I * V  (Watts)
+
+    // Guard against sensor noise producing negative/near-zero readings
+    if (power < 0) power = 0;
+
+    float energyIncrement = power * elapsedHours; // Wh added this sample
+    cumulativeEnergyWh += energyIncrement;
+    totalEnergyWh += energyIncrement;
+
+    Serial.print("V: "); Serial.print(voltage);
+    Serial.print(" I: "); Serial.print(current);
+    Serial.print(" P: "); Serial.print(power);
+    Serial.print(" Wh(hr): "); Serial.println(cumulativeEnergyWh);
+
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  // ---- Reset the hourly accumulator every hour ----
+  if (now - hourStartTime >= HOUR_MS) {
+    cumulativeEnergyWh = 0.0;
+    hourStartTime = now;
+  }
+
+  // ---- Alternate LCD screens ----
+  if (now - lastDisplaySwitch >= DISPLAY_SWITCH_MS) {
+    showEnergyScreen = !showEnergyScreen;
+    lastDisplaySwitch = now;
+  }
+
+  if (showEnergyScreen) {
+    displayEnergyScreen();
+  } else {
+    displayStatusScreen();
+  }
+}
+
+// ---------------------------------------------------------------
+// Read current from ACS712 (averaged over several samples for stability)
+// ---------------------------------------------------------------
+float readCurrent() {
+  const int numSamples = 20;
+  long total = 0;
+  for (int i = 0; i < numSamples; i++) {
+    total += analogRead(CURRENT_SENSOR_PIN);
+    delayMicroseconds(200);
+  }
+  float avgReading = total / (float)numSamples;
+  float sensorVoltage = (avgReading / ADC_RESOLUTION) * ARDUINO_VREF;
+  float current = (sensorVoltage - ACS_ZERO_VOLTAGE) / ACS_SENSITIVITY;
+  return current;
+}
+
+// ---------------------------------------------------------------
+// Read voltage from the voltage sensor module
+// ---------------------------------------------------------------
+float readVoltage() {
+  const int numSamples = 20;
+  long total = 0;
+  for (int i = 0; i < numSamples; i++) {
+    total += analogRead(VOLTAGE_SENSOR_PIN);
+    delayMicroseconds(200);
+  }
+  float avgReading = total / (float)numSamples;
+  float sensorVoltage = (avgReading / ADC_RESOLUTION) * ARDUINO_VREF;
+  float actualVoltage = sensorVoltage * VOLTAGE_DIVIDER_RATIO;
+  return actualVoltage;
+}
+
+// ---------------------------------------------------------------
+// LCD Screen 1: current energy consumption for this hour
+// ---------------------------------------------------------------
+void displayEnergyScreen() {
+  lcd.setCursor(0, 0);
+  lcd.print("Energy: ");
+  lcd.print((int)cumulativeEnergyWh);
+  lcd.print("Wh   ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Total: ");
+  lcd.print(totalEnergyWh / 1000.0, 2);
+  lcd.print("kWh ");
+}
+
+// ---------------------------------------------------------------
+// LCD Screen 2: efficiency status vs pre-programmed baseline
+// ---------------------------------------------------------------
+void displayStatusScreen() {
+  float usagePercent = (cumulativeEnergyWh / HOURLY_BASELINE_WH) * 100.0;
+
+  lcd.setCursor(0, 0);
+  lcd.print("Usage: ");
+  lcd.print((int)usagePercent);
+  lcd.print("%      ");
+
+  lcd.setCursor(0, 1);
+  if (usagePercent < 75.0) {
+    lcd.print("Efficient Power ");
+  } else if (usagePercent <= 100.0) {
+    lcd.print("Warning:NearLim ");
+  } else {
+    lcd.print("Limit Exceeded! ");
+  }
+}
