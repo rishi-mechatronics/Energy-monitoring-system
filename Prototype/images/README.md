@@ -8,4 +8,3 @@ Photos and screenshots documenting the Energy Consumption Monitoring System prot
 - **effiency status.jpeg** – LCD showing efficiency status message
 - **power calculations.jpeg** – LCD showing calculated power/energy values
 - **load to be monitored.jpeg** – The load device being monitored
-- **real time calculations.mp4** – Demo video of the system performing real-time calculations
